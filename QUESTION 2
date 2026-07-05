@@ -1,0 +1,199 @@
+"""
+MFI 8302 — Computational Methods in Finance
+Part III: Monte Carlo Methods
+
+Exercise 2 — Convergence Study (Euler–Maruyama scheme)
+Parameters: S0=100, K=100, r=0.05, sigma=0.20, T=1.
+
+Tasks:
+  (1) Fix m=100, vary M ∈ {1e2,1e3,1e4,1e5}. Verify SE ∝ 1/√M.
+  (2) Fix M=1e5, vary m ∈ {10,50,100,500,1000}. Check for systematic bias.
+  (3) Convergence table of |V̂_M − V_BS| as a function of (M, m).
+  (4) Optimal (M*, m*) allocation for budget C = 1e7 operations.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+MASTER_SEED = 35
+
+# -------------------------------------------------------------
+# Analytical benchmark
+# -------------------------------------------------------------
+def bs_call(S0, K, r, sigma, T):
+    d1 = (np.log(S0/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    return S0*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+
+# -------------------------------------------------------------
+# Euler–Maruyama MC estimator for a European call
+#   dS_t = r S_t dt + σ S_t dW_t
+#   S_{t+Δt} = S_t + r S_t Δt + σ S_t √Δt · Z
+# -------------------------------------------------------------
+def mc_euler_call(S0, K, r, sigma, T, M, m, seed=None):
+    """
+    M : number of simulated paths
+    m : number of Euler time steps on [0, T]
+    Returns (price_estimate, standard_error).
+    """
+    rng = np.random.default_rng(seed)
+    dt  = T / m
+    sdt = np.sqrt(dt)
+    S   = np.full(M, S0, dtype=np.float64)
+
+    for _ in range(m):
+        Z = rng.standard_normal(M)
+        S = S + r*S*dt + sigma*S*sdt*Z
+        np.maximum(S, 0.0, out=S)          # guard against negative S from Euler
+
+    disc   = np.exp(-r*T)
+    payoff = disc * np.maximum(S - K, 0.0)
+    return payoff.mean(), payoff.std(ddof=1) / np.sqrt(M)
+
+
+# =============================================================
+# Setup
+# =============================================================
+S0, K, r, sigma, T = 100.0, 100.0, 0.05, 0.20, 1.0
+V_BS = bs_call(S0, K, r, sigma, T)
+
+print("="*70)
+print("  Exercise 2 — Euler-Scheme Convergence Study")
+print("="*70)
+print(f"\nBlack–Scholes call price: V_BS = {V_BS:.6f}\n")
+
+
+# =============================================================
+# (2.1) SE ∝ 1/√M   [m = 100 fixed]
+# =============================================================
+print("-"*70)
+print("(2.1)  Fix m = 100, vary M — verify SE ∝ 1/√M")
+print("-"*70)
+
+Ms  = [10**2, 10**3, 10**4, 10**5]
+rows_a = []
+for M in Ms:
+    V, SE = mc_euler_call(S0, K, r, sigma, T, M, m=100, seed=MASTER_SEED + M)
+    rows_a.append({
+        "M"           : M,
+        "V_hat"       : V,
+        "SE"          : SE,
+        "SE * sqrt(M)": SE*np.sqrt(M),        # should be ~constant
+        "|V_hat-V_BS|": abs(V - V_BS),
+    })
+df_a = pd.DataFrame(rows_a)
+print(df_a.to_string(index=False, formatters={
+    "M":"{:>7d}".format, "V_hat":"{:.5f}".format,
+    "SE":"{:.5f}".format, "SE * sqrt(M)":"{:.4f}".format,
+    "|V_hat-V_BS|":"{:.5f}".format}))
+
+
+# =============================================================
+# (2.2) Systematic bias?   [M = 1e5 fixed]
+# =============================================================
+print("\n" + "-"*70)
+print("(2.2)  Fix M = 1e5, vary m — check for bias")
+print("-"*70)
+
+ms = [10, 50, 100, 500, 1000]
+rows_b = []
+for m in ms:
+    V, SE = mc_euler_call(S0, K, r, sigma, T, M=10**5, m=m,
+                          seed=MASTER_SEED + m)
+    rows_b.append({
+        "m"    : m,
+        "V_hat": V,
+        "SE"   : SE,
+        "bias" : V - V_BS,
+        "|bias|": abs(V - V_BS),
+    })
+df_b = pd.DataFrame(rows_b)
+print(df_b.to_string(index=False, formatters={
+    "m":"{:>5d}".format, "V_hat":"{:.5f}".format,
+    "SE":"{:.5f}".format, "bias":"{:+.5f}".format,
+    "|bias|":"{:.5f}".format}))
+
+
+# =============================================================
+# (2.3) Convergence table: error over grid of (M, m)
+# =============================================================
+print("\n" + "-"*70)
+print("(2.3)  Error |V_hat − V_BS| over grid of (M, m)")
+print("-"*70)
+
+M_grid = [10**3, 10**4, 10**5]
+m_grid = [10, 50, 100, 500]
+err = np.zeros((len(M_grid), len(m_grid)))
+for i, M in enumerate(M_grid):
+    for j, mm in enumerate(m_grid):
+        V, _ = mc_euler_call(S0, K, r, sigma, T, M, mm,
+                             seed=MASTER_SEED + M + 1000*mm)
+        err[i, j] = abs(V - V_BS)
+
+df_c = pd.DataFrame(err,
+                    index=[f"M={M}"  for M  in M_grid],
+                    columns=[f"m={mm}" for mm in m_grid])
+print(df_c.to_string(float_format="{:.5f}".format))
+
+
+# =============================================================
+# (2.4) Optimal (M*, m*) allocation for budget C = 1e7
+# -------------------------------------------------------------
+# Weak Euler on GBM: bias ≈ c1/m ;  MC noise: SE ≈ c2/√M
+# MSE = c1²/m² + c2²/M          Cost:  M·m = C
+# Substituting M = C/m and setting d(MSE)/dm = 0 ⇒
+#     m* = ( 2 c1² C / c2² )^{1/3}
+#     M* = C / m*
+# ⇒ m* ∝ C^{1/3},  M* ∝ C^{2/3}
+# =============================================================
+print("\n" + "-"*70)
+print("(2.4)  Optimal (M*, m*) allocation for budget C = M·m = 1e7")
+print("-"*70)
+
+budget = 1e7
+c1 = np.mean([abs(row["bias"]) * row["m"] for _, row in df_b.iterrows()])
+c2 = df_a["SE * sqrt(M)"].mean()
+m_star = (2 * c1**2 * budget / c2**2) ** (1/3)
+M_star = budget / m_star
+
+print(f"  Estimated bias constant   c1 ≈ {c1:.4f}   (bias ≈ c1/m)")
+print(f"  Estimated stderr constant c2 ≈ {c2:.4f}   (SE   ≈ c2/√M)")
+print(f"\n  ⇒ m* ≈ {m_star:.1f}   (≈ {round(m_star)} steps)")
+print(f"  ⇒ M* ≈ {M_star:.0f}  (≈ {int(round(M_star)):,} paths)")
+
+
+# =============================================================
+# Plots
+# =============================================================
+# (a) SE vs M — log–log
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.loglog(df_a["M"], df_a["SE"], "o-", lw=2, label="Euler SE (m = 100)")
+ref = df_a["SE"].iloc[0] * np.sqrt(df_a["M"].iloc[0] / np.array(Ms))
+ax.loglog(Ms, ref, "k--", alpha=0.6, label=r"reference $\propto 1/\sqrt{M}$")
+ax.set_xlabel("M (paths)")
+ax.set_ylabel("Standard error")
+ax.set_title(r"Ex 2.1 — Euler SE $\propto 1/\sqrt{M}$")
+ax.grid(True, which="both", alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig("ex2a_se_vs_M.png", dpi=140)
+plt.close()
+
+# (b) Bias vs m
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.errorbar(df_b["m"], df_b["V_hat"], yerr=2*df_b["SE"], fmt="o-",
+            capsize=4, lw=2, label=r"$\hat V_M \pm 2\,\mathrm{SE}$  (M = $10^5$)")
+ax.axhline(V_BS, color="k", ls="--", label=f"$V_{{BS}} = {V_BS:.4f}$")
+ax.set_xscale("log")
+ax.set_xlabel("m (time steps)")
+ax.set_ylabel("Price estimate")
+ax.set_title("Ex 2.2 — Discretization bias vs. m")
+ax.grid(True, alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig("ex2b_bias_vs_m.png", dpi=140)
+plt.close()
+
+print("\nSaved: ex2a_se_vs_M.png, ex2b_bias_vs_m.png")
