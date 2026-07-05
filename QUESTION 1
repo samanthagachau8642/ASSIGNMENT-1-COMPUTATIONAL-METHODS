@@ -1,0 +1,97 @@
+"""
+MFI 8302 — Computational Methods in Finance
+Part III: Monte Carlo Methods in Finance
+Exercise 1 — European Options and Put–Call Parity
+
+
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+
+# ---- reproducibility ------------------------------------------------------- #
+SEED = 35
+rng  = np.random.default_rng(SEED)
+
+# ---- Black–Scholes closed form (benchmark) --------------------------------- #
+def bs_european(S0, K, r, sigma, T):
+    d1 = (np.log(S0/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    call = S0*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+    put  = K*np.exp(-r*T)*norm.cdf(-d2) - S0*norm.cdf(-d1)
+    return call, put
+
+# ---- Plain MC pricer using EXACT GBM simulation ---------------------------- #
+def mc_european_exact(S0, K, r, sigma, T, M, rng):
+    """
+    Plain Monte Carlo estimator using the exact GBM law:
+        S_T = S0 * exp((r - 0.5*sigma^2)*T + sigma*sqrt(T)*Z),   Z ~ N(0,1)
+
+    Returns:
+        C_hat, SE_C  — call estimate and its standard error
+        P_hat, SE_P  — put  estimate and its standard error
+        D_hat, SE_D  — estimate of (C - P) and its SE, computed from the
+                       paired difference on the same paths (used for the
+                       put-call parity check).
+    """
+    Z    = rng.standard_normal(M)
+    ST   = S0 * np.exp((r - 0.5*sigma**2)*T + sigma*np.sqrt(T)*Z)
+    disc = np.exp(-r*T)
+
+    call_pay = disc * np.maximum(ST - K, 0.0)
+    put_pay  = disc * np.maximum(K - ST, 0.0)
+    diff     = call_pay - put_pay          # = disc * (S_T - K) identically
+
+    C_hat, SE_C = call_pay.mean(), call_pay.std(ddof=1)/np.sqrt(M)
+    P_hat, SE_P = put_pay.mean(),  put_pay.std(ddof=1)/np.sqrt(M)
+    D_hat, SE_D = diff.mean(),     diff.std(ddof=1)/np.sqrt(M)
+    return C_hat, SE_C, P_hat, SE_P, D_hat, SE_D
+
+# =========================================================================== #
+# Main
+# =========================================================================== #
+S0, K, r, sigma, T = 100.0, 100.0, 0.05, 0.2, 1.0
+Ms = [10**3, 10**4, 10**5, 10**6]
+
+# Analytical benchmarks
+C_bs, P_bs    = bs_european(S0, K, r, sigma, T)
+parity_target = S0 - K*np.exp(-r*T)
+
+print(f"Black–Scholes benchmark  :  C = {C_bs:.6f}   P = {P_bs:.6f}")
+print(f"Parity target  S0 − K e^(−rT) = {parity_target:.6f}\n")
+
+# Table of MC results
+rows = []
+for M in Ms:
+    C_hat, SE_C, P_hat, SE_P, D_hat, SE_D = mc_european_exact(
+        S0, K, r, sigma, T, M, rng
+    )
+    err_parity = abs(D_hat - parity_target)
+    passes     = err_parity < 2*SE_D
+    rows.append([M, C_hat, SE_C, P_hat, SE_P,
+                 D_hat, err_parity, 2*SE_D, passes])
+
+df = pd.DataFrame(
+    rows,
+    columns=["M", "C_hat", "SE_C", "P_hat", "SE_P",
+             "C - P", "|parity err|", "2·SE(C-P)", "< 2 SE?"]
+)
+
+print(df.to_string(index=False, formatters={
+    "M":            lambda v: f"{v:>7d}",
+    "C_hat":        lambda v: f"{v:9.5f}",
+    "SE_C":         lambda v: f"{v:9.5f}",
+    "P_hat":        lambda v: f"{v:9.5f}",
+    "SE_P":         lambda v: f"{v:9.5f}",
+    "C - P":        lambda v: f"{v:9.6f}",
+    "|parity err|": lambda v: f"{v:9.6f}",
+    "2·SE(C-P)":    lambda v: f"{v:9.6f}",
+    "< 2 SE?":      lambda v: str(v),
+}))
+
+# Convergence rate diagnostic: SE * sqrt(M) should be ~ constant
+print("\nConvergence check — SE_C · √M  (should be roughly constant):")
+for row in rows:
+    M_, _, SE_C, *_ = row
+    print(f"   M = {M_:>7d}   SE·√M = {SE_C*np.sqrt(M_):.5f}")
