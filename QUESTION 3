@@ -1,0 +1,198 @@
+"""
+MFI 8302 — Computational Methods in Finance
+Part III: Monte Carlo Methods
+
+Exercise 3 — Digital Call Option
+Parameters: S0=5, K=5, r=0.06, sigma=0.30, T=1.
+
+Tasks:
+  (1) Analytical BS price:  V_dig = e^{-rT} Φ(d2).
+  (2) Plain MC (exact GBM) for M ∈ {1e3, 1e4, 1e5, 1e6}.
+  (3) Compare convergence with the vanilla call. Which has larger SE? Why?
+  (4) Plot both convergence curves on the same axes with 95% CIs.
+
+Design note: written in an OO style — one Pricer class per option so that
+the digital-vs-vanilla comparison is symmetric and easy to extend
+(e.g. add antithetic sampling, control variates, etc.).
+"""
+
+from dataclasses import dataclass
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+
+# =============================================================
+# Market / contract parameters
+# =============================================================
+@dataclass(frozen=True)
+class Market:
+    S0    : float
+    r     : float
+    sigma : float
+    T     : float
+
+    def simulate_ST(self, M, rng):
+        """Exact one-shot GBM: S_T = S0 · exp((r − σ²/2)T + σ√T · Z)."""
+        Z = rng.standard_normal(M)
+        return self.S0 * np.exp((self.r - 0.5*self.sigma**2)*self.T
+                                + self.sigma*np.sqrt(self.T)*Z)
+
+    @property
+    def d2(self):
+        return -0.5*self.sigma*np.sqrt(self.T)   # only used when K = S0; generic below
+
+    def d1_d2(self, K):
+        d1 = (np.log(self.S0/K) + (self.r + 0.5*self.sigma**2)*self.T) \
+              / (self.sigma*np.sqrt(self.T))
+        return d1, d1 - self.sigma*np.sqrt(self.T)
+
+
+# =============================================================
+# Pricer base class — each subclass supplies (payoff, analytical)
+# =============================================================
+class OptionPricer:
+    name = "Option"
+
+    def __init__(self, market: Market, K: float):
+        self.mkt, self.K = market, K
+
+    # override in subclasses ---------------------------------
+    def payoff(self, S_T):        raise NotImplementedError
+    def analytical_price(self):   raise NotImplementedError
+    # --------------------------------------------------------
+
+    def mc_price(self, M, seed=None):
+        rng     = np.random.default_rng(seed)
+        S_T     = self.mkt.simulate_ST(M, rng)
+        disc    = np.exp(-self.mkt.r * self.mkt.T)
+        payoffs = disc * self.payoff(S_T)
+        return payoffs.mean(), payoffs.std(ddof=1) / np.sqrt(M)
+
+
+class DigitalCall(OptionPricer):
+    name = "Digital call"
+
+    def payoff(self, S_T):
+        return (S_T > self.K).astype(np.float64)      # unit payoff if ITM
+
+    def analytical_price(self):
+        _, d2 = self.mkt.d1_d2(self.K)
+        return np.exp(-self.mkt.r * self.mkt.T) * norm.cdf(d2)
+
+
+class VanillaCall(OptionPricer):
+    name = "Vanilla call"
+
+    def payoff(self, S_T):
+        return np.maximum(S_T - self.K, 0.0)
+
+    def analytical_price(self):
+        d1, d2 = self.mkt.d1_d2(self.K)
+        return (self.mkt.S0 * norm.cdf(d1)
+                - self.K * np.exp(-self.mkt.r * self.mkt.T) * norm.cdf(d2))
+
+
+# =============================================================
+# Run the exercise
+# =============================================================
+MASTER_SEED = 35
+mkt         = Market(S0=5.0, r=0.06, sigma=0.30, T=1.0)
+digital     = DigitalCall(mkt, K=5.0)
+vanilla     = VanillaCall(mkt, K=5.0)
+
+print("="*70)
+print("  Exercise 3 — Digital Call vs. Vanilla Call")
+print("="*70)
+
+# ---- (3.1) Analytical benchmarks ----------------------------
+V_dig_BS = digital.analytical_price()
+V_van_BS = vanilla.analytical_price()
+print(f"\n(3.1) Analytical BS prices:")
+print(f"      Digital  V_dig = e^(-rT)·Φ(d2) = {V_dig_BS:.6f}")
+print(f"      Vanilla  C_van                 = {V_van_BS:.6f}")
+
+# ---- (3.2) MC pricing across M ------------------------------
+print(f"\n(3.2) Plain MC (exact GBM):")
+Ms   = [10**3, 10**4, 10**5, 10**6]
+rows = []
+for M in Ms:
+    Vd, SEd = digital.mc_price(M, seed=MASTER_SEED + M)
+    Vv, SEv = vanilla.mc_price(M, seed=MASTER_SEED + M)   # same seed → paired paths
+    rows.append({
+        "M"           : M,
+        "V_dig"       : Vd, "SE_dig": SEd, "SE_dig/V_dig": SEd/Vd,
+        "V_van"       : Vv, "SE_van": SEv, "SE_van/V_van": SEv/Vv,
+        "ratio SE_van/SE_dig": SEv/SEd,
+    })
+df = pd.DataFrame(rows)
+print(df.to_string(index=False, formatters={
+    "M":"{:>7d}".format,
+    "V_dig":"{:.5f}".format,  "SE_dig":"{:.5f}".format,
+    "SE_dig/V_dig":"{:.4f}".format,
+    "V_van":"{:.5f}".format,  "SE_van":"{:.5f}".format,
+    "SE_van/V_van":"{:.4f}".format,
+    "ratio SE_van/SE_dig":"{:.2f}".format}))
+
+# ---- (3.3) Which has larger SE and why? ---------------------
+# Compute the population payoff variances explicitly:
+#   digital:  Var(1{S_T>K}) e^{-2rT} = e^{-2rT} · p(1-p)
+#   vanilla:  no closed form → estimate from a huge sample once
+_, d2 = mkt.d1_d2(5.0)
+p_itm = norm.cdf(d2)                                  # P(S_T > K) under Q
+var_dig_analytic = np.exp(-2*mkt.r*mkt.T) * p_itm * (1 - p_itm)
+
+# Estimate Var of vanilla payoff via one large batch
+rng_big = np.random.default_rng(MASTER_SEED)
+S_big   = mkt.simulate_ST(10**6, rng_big)
+van_payoff_big = np.exp(-mkt.r*mkt.T) * np.maximum(S_big - 5.0, 0.0)
+var_van_estimated = van_payoff_big.var(ddof=1)
+
+print(f"\n(3.3) Payoff variances (per single draw):")
+print(f"      Var[digital payoff]  = e^(-2rT)·p(1-p) = {var_dig_analytic:.4f}")
+print(f"      Var[vanilla payoff]  ≈ {var_van_estimated:.4f}   "
+      f"(from 1e6 draws)")
+print(f"      Ratio Var_van / Var_dig ≈ {var_van_estimated/var_dig_analytic:.2f}")
+print(f"      ⇒ per-path noise is √{var_van_estimated/var_dig_analytic:.2f}"
+      f" ≈ {np.sqrt(var_van_estimated/var_dig_analytic):.2f}× larger for vanilla,"
+      f"\n        which is exactly the SE ratio seen in the table above.")
+
+# ---- (3.4) Convergence plot with 95% CIs --------------------
+fig, ax = plt.subplots(figsize=(8, 5.5))
+ax.errorbar(df["M"], df["V_dig"], yerr=1.96*df["SE_dig"],
+            fmt="o-", capsize=4, lw=2,
+            label="Digital MC (95% CI)")
+ax.axhline(V_dig_BS, color="C0", ls=":",
+           label=f"BS digital = {V_dig_BS:.4f}")
+ax.errorbar(df["M"], df["V_van"], yerr=1.96*df["SE_van"],
+            fmt="s-", capsize=4, lw=2,
+            label="Vanilla MC (95% CI)")
+ax.axhline(V_van_BS, color="C1", ls=":",
+           label=f"BS vanilla = {V_van_BS:.4f}")
+ax.set_xscale("log")
+ax.set_xlabel("M (paths)")
+ax.set_ylabel("Price estimate")
+ax.set_title("Ex 3 — Digital vs. Vanilla: convergence and 95% CIs")
+ax.grid(True, which="both", alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig("ex3_digital_vs_vanilla.png", dpi=140)
+plt.close()
+
+# Extra: log–log SE comparison
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.loglog(df["M"], df["SE_dig"], "o-", lw=2, label="Digital SE")
+ax.loglog(df["M"], df["SE_van"], "s-", lw=2, label="Vanilla SE")
+ref = df["SE_dig"].iloc[0] * np.sqrt(df["M"].iloc[0] / np.array(Ms))
+ax.loglog(Ms, ref, "k--", alpha=0.6, label=r"$\propto 1/\sqrt{M}$")
+ax.set_xlabel("M (paths)")
+ax.set_ylabel("Standard error")
+ax.set_title("Ex 3 — Absolute SE: both options obey the $1/\\sqrt{M}$ rate")
+ax.grid(True, which="both", alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.savefig("ex3_se_loglog.png", dpi=140)
+plt.close()
+
+print("\nSaved: ex3_digital_vs_vanilla.png, ex3_se_loglog.png")
